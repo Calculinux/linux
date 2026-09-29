@@ -44,4 +44,14 @@
 
 #define RK_FUNC_GPIO	0
 
+/*
+ * Encodings for the generic 'pinmux' property.
+ *
+ * RK_PINMUX() selects the iomux function of a pad, RK_RMIO() selects the
+ * function of a pin of an RMIO (Rockchip Matrix I/O) block. A pad reaches
+ * its RMIO pin when its iomux function routes it to the RMIO block.
+ */
+#define RK_PINMUX(bank, pin, func)	(((bank) << 16) | ((pin) << 8) | (func))
+#define RK_RMIO(id, pin, func)		(((id) << 16) | ((pin) << 8) | (func))
+
 #endif

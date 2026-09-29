@@ -74,6 +74,16 @@ properties:
       The phandle of the syscon node for the IOC1 registers, which hold the
       iomux, pull and drive strength settings of pin bank 1 on rk3506.
 
+  rockchip,rmio:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    description:
+      The phandles of the syscon nodes holding the registers of the RMIO
+      (Rockchip Matrix I/O) blocks, in the order of their RMIO index. An
+      RMIO block adds a second level of muxing, selecting the function of
+      each of its pins from a large set of peripheral signals.
+    items:
+      maxItems: 1
+
   "#address-cells":
     enum: [1, 2]
 
@@ -95,6 +105,7 @@ allOf:
     else:
       properties:
         rockchip,ioc1: false
+        rockchip,rmio: false
 
 required:
   - compatible
@@ -163,6 +174,75 @@ additionalProperties:
                 The phandle of a node contains the generic pinconfig options
                 to use as described in pinctrl-bindings.txt.
 
+      iomux:
+        type: object
+        description:
+          The pads of the group, muxed with the generic pinmux property, and
+          the generic pin configuration applied to all of them.
+        allOf:
+          - $ref: pincfg-node.yaml#
+          - $ref: pinmux-node.yaml#
+
+        properties:
+          pinmux:
+            description:
+              List of RK_PINMUX(bank, pin, function) values from
+              <dt-bindings/pinctrl/rockchip.h>.
+
+          bias-disable: true
+
+          bias-pull-down: true
+
+          bias-pull-pin-default: true
+
+          bias-pull-up: true
+
+          drive-strength:
+            minimum: 0
+            maximum: 20
+
+          input-enable: true
+
+          input-schmitt-enable: true
+
+          output-high: true
+
+          output-low: true
+
+        required:
+          - pinmux
+
+        additionalProperties: false
+
+      rmio:
+        type: object
+        description:
+          The functions of the RMIO pins used by the group. Each RMIO pin is
+          wired to one pad, which the iomux node has to route to the RMIO
+          block.
+        $ref: pinmux-node.yaml#
+
+        properties:
+          pinmux:
+            description:
+              List of RK_RMIO(rmio, pin, function) values from
+              <dt-bindings/pinctrl/rockchip.h>.
+
+        required:
+          - pinmux
+
+        additionalProperties: false
+
+    oneOf:
+      - required:
+          - rockchip,pins
+      - required:
+          - iomux
+
+    dependentRequired:
+      rmio:
+        - iomux
+
 examples:
   - |
     #include <dt-bindings/interrupt-controller/arm-gic.h>
@@ -210,4 +290,31 @@ examples:
       pinctrl-names = "default";
       reg-io-width = <1>;
       reg-shift = <2>;
+    };
+
+  - |
+    #include <dt-bindings/pinctrl/rockchip.h>
+
+    pinctrl {
+      compatible = "rockchip,rk3506-pinctrl";
+      rockchip,grf = <&ioc_grf>;
+      rockchip,pmu = <&ioc_pmu>;
+      rockchip,ioc1 = <&ioc1>;
+      rockchip,rmio = <&grf_pmu>;
+
+      i2c2 {
+        i2c2_rmio: i2c2-rmio {
+          iomux {
+            pinmux = <RK_PINMUX(0, RK_PB2, 7)>,
+                     <RK_PINMUX(0, RK_PB3, 7)>;
+            bias-disable;
+          };
+
+          rmio {
+            /* RM_IO10 is I2C2 SCL, RM_IO11 is I2C2 SDA */
+            pinmux = <RK_RMIO(0, 10, 19)>,
+                     <RK_RMIO(0, 11, 20)>;
+          };
+        };
+      };
     };
