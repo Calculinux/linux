@@ -413,7 +413,10 @@ static int rockchip_dt_node_to_map(struct pinctrl_dev *pctldev,
 		return -EINVAL;
 	}
 
-	map_num += grp->npins;
+	/* pinmux style groups may leave the configuration of pins untouched */
+	for (i = 0; i < grp->npins; i++)
+		if (grp->data[i].nconfigs)
+			map_num++;
 
 	new_map = kzalloc_objs(*new_map, map_num);
 	if (!new_map)
@@ -436,11 +439,15 @@ static int rockchip_dt_node_to_map(struct pinctrl_dev *pctldev,
 	/* create config map */
 	new_map++;
 	for (i = 0; i < grp->npins; i++) {
-		new_map[i].type = PIN_MAP_TYPE_CONFIGS_PIN;
-		new_map[i].data.configs.group_or_pin =
+		if (!grp->data[i].nconfigs)
+			continue;
+
+		new_map->type = PIN_MAP_TYPE_CONFIGS_PIN;
+		new_map->data.configs.group_or_pin =
 				pin_get_name(pctldev, grp->pins[i]);
-		new_map[i].data.configs.configs = grp->data[i].configs;
-		new_map[i].data.configs.num_configs = grp->data[i].nconfigs;
+		new_map->data.configs.configs = grp->data[i].configs;
+		new_map->data.configs.num_configs = grp->data[i].nconfigs;
+		new_map++;
 	}
 
 	dev_dbg(dev, "maps: function %s group %s num %d\n",
@@ -1570,6 +1577,76 @@ static int rockchip_set_mux(struct rockchip_pin_bank *bank, int pin, int mux)
 	ret = regmap_update_bits(regmap, reg, rmask, data);
 
 	return ret;
+}
+
+static int rockchip_set_rmio(struct rockchip_pinctrl *info,
+			     const struct rockchip_rmio_config *cfg, u32 func)
+{
+	const struct rockchip_rmio_data *rmio = &info->ctrl->rmios[cfg->id];
+	u32 mask = GENMASK(rmio->width - 1, 0);
+
+	dev_dbg(info->dev, "setting func of RMIO%u-%u to %u\n",
+		cfg->id, cfg->pin, func);
+
+	return regmap_write(info->regmap_rmio[cfg->id],
+			    rmio->offset + 4 * cfg->pin,
+			    (mask << 16) | (func & mask));
+}
+
+/*
+ * A function must not be selected on more than one pin of an RMIO block,
+ * or none of those pins gets connected. Fail if another pin that is in
+ * use as RMIO pin already selects the function, and drop the selection
+ * from pins that are not, as left behind by an earlier state or the
+ * bootloader.
+ */
+static int rockchip_rmio_release_func(struct rockchip_pinctrl *info,
+				      const struct rockchip_rmio_config *cfg)
+{
+	const struct rockchip_rmio_data *rmio = &info->ctrl->rmios[cfg->id];
+	struct regmap *regmap = info->regmap_rmio[cfg->id];
+	u32 mask = GENMASK(rmio->width - 1, 0);
+	u32 pin, val;
+	int ret;
+
+	/* function 0 connects nothing and may be selected on any pin */
+	if (!cfg->func)
+		return 0;
+
+	for (pin = 0; pin < rmio->nr_pins; pin++) {
+		struct rockchip_pin_bank *bank;
+		const struct pin_desc *desc;
+
+		if (pin == cfg->pin)
+			continue;
+
+		ret = regmap_read(regmap, rmio->offset + 4 * pin, &val);
+		if (ret)
+			return ret;
+
+		if ((val & mask) != cfg->func)
+			continue;
+
+		bank = bank_num_to_bank(info, rmio->pads[pin].bank);
+		if (IS_ERR(bank))
+			return PTR_ERR(bank);
+
+		desc = pin_desc_get(info->pctl_dev,
+				    bank->pin_base + rmio->pads[pin].pin);
+		if (desc && desc->mux_usecount &&
+		    rockchip_get_mux(bank, rmio->pads[pin].pin) == rmio->iomux_func) {
+			dev_err(info->dev,
+				"RMIO%u function %u is already used by RMIO pin %u\n",
+				cfg->id, cfg->func, pin);
+			return -EBUSY;
+		}
+
+		ret = regmap_write(regmap, rmio->offset + 4 * pin, mask << 16);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
 }
 
 #define PX30_PULL_PMU_OFFSET		0x10
@@ -4001,20 +4078,36 @@ static int rockchip_pmx_set(struct pinctrl_dev *pctldev, unsigned selector,
 			    unsigned group)
 {
 	struct rockchip_pinctrl *info = pinctrl_dev_get_drvdata(pctldev);
-	const unsigned int *pins = info->groups[group].pins;
-	const struct rockchip_pin_config *data = info->groups[group].data;
+	const struct rockchip_pin_group *grp = &info->groups[group];
+	const unsigned int *pins = grp->pins;
+	const struct rockchip_pin_config *data = grp->data;
 	struct device *dev = info->dev;
 	struct rockchip_pin_bank *bank;
-	int cnt, ret = 0;
+	int cnt, rcnt, ret = 0;
 
 	dev_dbg(dev, "enable function %s group %s\n",
-		info->functions[selector].name, info->groups[group].name);
+		info->functions[selector].name, grp->name);
+
+	/*
+	 * Select the RMIO functions before routing the pads to the RMIO
+	 * block, so a pad never drives the previous function of its RMIO pin.
+	 */
+	for (rcnt = 0; rcnt < grp->nrmios; rcnt++) {
+		ret = rockchip_rmio_release_func(info, &grp->rmios[rcnt]);
+		if (ret)
+			goto revert_rmio;
+
+		ret = rockchip_set_rmio(info, &grp->rmios[rcnt],
+					grp->rmios[rcnt].func);
+		if (ret)
+			goto revert_rmio;
+	}
 
 	/*
 	 * for each pin in the pin group selected, program the corresponding
 	 * pin function number in the config register.
 	 */
-	for (cnt = 0; cnt < info->groups[group].npins; cnt++) {
+	for (cnt = 0; cnt < grp->npins; cnt++) {
 		bank = pin_to_bank(info, pins[cnt]);
 		ret = rockchip_set_mux(bank, pins[cnt] - bank->pin_base,
 				       data[cnt].func);
@@ -4029,10 +4122,16 @@ static int rockchip_pmx_set(struct pinctrl_dev *pctldev, unsigned selector,
 			rockchip_set_mux(bank, pins[cnt] - bank->pin_base, 0);
 		}
 
-		return ret;
+		goto revert_rmio;
 	}
 
 	return 0;
+
+revert_rmio:
+	for (rcnt--; rcnt >= 0; rcnt--)
+		rockchip_set_rmio(info, &grp->rmios[rcnt], 0);
+
+	return ret;
 }
 
 static int rockchip_pmx_gpio_request_enable(struct pinctrl_dev *pctldev,
@@ -4314,6 +4413,164 @@ static void rockchip_pinctrl_child_count(struct rockchip_pinctrl *info,
 	}
 }
 
+/*
+ * Decode a 'pinmux' entry built with RK_PINMUX() or RK_RMIO() from
+ * <dt-bindings/pinctrl/rockchip.h>.
+ */
+static int rockchip_pinmux_decode(u32 val, u32 *index, u32 *pin, u32 *func)
+{
+	if (val >> 24)
+		return -EINVAL;
+
+	*index = (val >> 16) & 0xff;
+	*pin = (val >> 8) & 0xff;
+	*func = val & 0xff;
+
+	return 0;
+}
+
+static int rockchip_pinctrl_parse_rmio(struct device_node *np,
+				       struct rockchip_pin_group *grp,
+				       struct rockchip_pinctrl *info)
+{
+	struct rockchip_pin_ctrl *ctrl = info->ctrl;
+	struct device *dev = info->dev;
+	int i, j, n;
+
+	n = of_property_count_u32_elems(np, "pinmux");
+	if (n <= 0)
+		return dev_err_probe(dev, -EINVAL,
+				     "%pOF: pinmux: expected one or more entries\n", np);
+
+	grp->nrmios = n;
+	grp->rmios = devm_kcalloc(dev, n, sizeof(*grp->rmios), GFP_KERNEL);
+	if (!grp->rmios)
+		return -ENOMEM;
+
+	for (i = 0; i < n; i++) {
+		struct rockchip_rmio_config *cfg = &grp->rmios[i];
+		const struct rockchip_rmio_data *rmio;
+		struct rockchip_pin_bank *bank;
+		unsigned int pad;
+		u32 val;
+
+		of_property_read_u32_index(np, "pinmux", i, &val);
+		if (rockchip_pinmux_decode(val, &cfg->id, &cfg->pin, &cfg->func) ||
+		    cfg->id >= ctrl->nr_rmios)
+			return dev_err_probe(dev, -EINVAL,
+					     "%pOF: invalid RMIO pinmux entry %#x\n", np, val);
+
+		rmio = &ctrl->rmios[cfg->id];
+		if (cfg->pin >= rmio->nr_pins || cfg->func >= BIT(rmio->width))
+			return dev_err_probe(dev, -EINVAL,
+					     "%pOF: invalid RMIO pinmux entry %#x\n", np, val);
+
+		if (!info->regmap_rmio[cfg->id])
+			return dev_err_probe(dev, -ENODEV,
+					     "%pOF: no rockchip,rmio syscon for RMIO%u\n",
+					     np, cfg->id);
+
+		for (j = 0; j < i; j++) {
+			const struct rockchip_rmio_config *prev = &grp->rmios[j];
+
+			if (prev->id == cfg->id &&
+			    (prev->pin == cfg->pin ||
+			     (cfg->func && prev->func == cfg->func)))
+				return dev_err_probe(dev, -EINVAL,
+						     "%pOF: RMIO pinmux entry %#x conflicts with an earlier entry\n",
+						     np, val);
+		}
+
+		bank = bank_num_to_bank(info, rmio->pads[cfg->pin].bank);
+		if (IS_ERR(bank))
+			return PTR_ERR(bank);
+
+		/* the iomux node has to route the pad of the RMIO pin to RMIO */
+		pad = bank->pin_base + rmio->pads[cfg->pin].pin;
+		for (j = 0; j < grp->npins; j++)
+			if (grp->pins[j] == pad &&
+			    grp->data[j].func == rmio->iomux_func)
+				break;
+
+		if (j == grp->npins)
+			return dev_err_probe(dev, -EINVAL,
+					     "%pOF: RMIO%u pin %u needs GPIO%u-%u muxed to function %u\n",
+					     np, cfg->id, cfg->pin, bank->bank_num,
+					     rmio->pads[cfg->pin].pin, rmio->iomux_func);
+	}
+
+	return 0;
+}
+
+/*
+ * Groups using the generic pinmux property describe their pads in an
+ * "iomux" node, together with the generic pin configuration applied to
+ * all of them, and the functions of RMIO pins in an optional "rmio" node.
+ */
+static int rockchip_pinctrl_parse_pinmux_group(struct device_node *np,
+					       struct rockchip_pin_group *grp,
+					       struct rockchip_pinctrl *info)
+{
+	struct device_node *iomux_np __free(device_node) =
+		of_get_child_by_name(np, "iomux");
+	struct device_node *rmio_np __free(device_node) =
+		of_get_child_by_name(np, "rmio");
+	struct device *dev = info->dev;
+	struct rockchip_pin_bank *bank;
+	unsigned long *configs;
+	unsigned int nconfigs;
+	int i, n, ret;
+
+	if (!iomux_np)
+		return dev_err_probe(dev, -EINVAL,
+				     "%pOF: expected rockchip,pins or an iomux node\n", np);
+
+	n = of_property_count_u32_elems(iomux_np, "pinmux");
+	if (n <= 0)
+		return dev_err_probe(dev, -EINVAL,
+				     "%pOF: pinmux: expected one or more entries\n",
+				     iomux_np);
+
+	ret = pinconf_generic_parse_dt_config(iomux_np, NULL, &configs, &nconfigs);
+	if (ret)
+		return ret;
+
+	grp->npins = n;
+	grp->pins = devm_kcalloc(dev, n, sizeof(*grp->pins), GFP_KERNEL);
+	grp->data = devm_kcalloc(dev, n, sizeof(*grp->data), GFP_KERNEL);
+	if (!grp->pins || !grp->data)
+		return -ENOMEM;
+
+	for (i = 0; i < n; i++) {
+		u32 val, num, pin, func;
+
+		of_property_read_u32_index(iomux_np, "pinmux", i, &val);
+		if (rockchip_pinmux_decode(val, &num, &pin, &func))
+			return dev_err_probe(dev, -EINVAL,
+					     "%pOF: invalid pinmux entry %#x\n",
+					     iomux_np, val);
+
+		bank = bank_num_to_bank(info, num);
+		if (IS_ERR(bank))
+			return PTR_ERR(bank);
+
+		if (pin >= bank->nr_pins)
+			return dev_err_probe(dev, -EINVAL,
+					     "%pOF: invalid pinmux entry %#x\n",
+					     iomux_np, val);
+
+		grp->pins[i] = bank->pin_base + pin;
+		grp->data[i].func = func;
+		grp->data[i].configs = configs;
+		grp->data[i].nconfigs = nconfigs;
+	}
+
+	if (rmio_np)
+		return rockchip_pinctrl_parse_rmio(rmio_np, grp, info);
+
+	return 0;
+}
+
 static int rockchip_pinctrl_parse_groups(struct device_node *np,
 					      struct rockchip_pin_group *grp,
 					      struct rockchip_pinctrl *info,
@@ -4331,6 +4588,9 @@ static int rockchip_pinctrl_parse_groups(struct device_node *np,
 
 	/* Initialise group */
 	grp->name = np->name;
+
+	if (!of_property_present(np, "rockchip,pins"))
+		return rockchip_pinctrl_parse_pinmux_group(np, grp, info);
 
 	/*
 	 * the binding format is rockchip,pins = <bank pin mux CONFIG>,
@@ -4823,6 +5083,31 @@ static int rockchip_pinctrl_probe(struct platform_device *pdev)
 
 	/* try to find the optional reference to the ioc1 syscon */
 	info->regmap_ioc1 = syscon_regmap_lookup_by_phandle_optional(np, "rockchip,ioc1");
+
+	/* RMIO syscons are optional, only groups using RMIO pins need them */
+	if (ctrl->nr_rmios) {
+		info->regmap_rmio = devm_kcalloc(dev, ctrl->nr_rmios,
+						 sizeof(*info->regmap_rmio),
+						 GFP_KERNEL);
+		if (!info->regmap_rmio)
+			return -ENOMEM;
+
+		for (i = 0; i < ctrl->nr_rmios; i++) {
+			struct device_node *rmio_np __free(device_node) =
+				of_parse_phandle(np, "rockchip,rmio", i);
+			struct regmap *regmap;
+
+			if (!rmio_np)
+				continue;
+
+			regmap = syscon_node_to_regmap(rmio_np);
+			if (IS_ERR(regmap))
+				return dev_err_probe(dev, PTR_ERR(regmap),
+						     "failed to get RMIO%d syscon\n", i);
+
+			info->regmap_rmio[i] = regmap;
+		}
+	}
 
 	if (ctrl->type == RK3308) {
 		ret = rk3308_soc_data_init(info);
@@ -5495,9 +5780,32 @@ static struct rockchip_pin_bank rk3506_pin_banks[] = {
 				    1, 1, 1, 1),
 };
 
+static const struct rockchip_rmio_pad rk3506_rmio_pads[] = {
+	{ 0, RK_PA0 }, { 0, RK_PA1 }, { 0, RK_PA2 }, { 0, RK_PA3 },
+	{ 0, RK_PA4 }, { 0, RK_PA5 }, { 0, RK_PA6 }, { 0, RK_PA7 },
+	{ 0, RK_PB0 }, { 0, RK_PB1 }, { 0, RK_PB2 }, { 0, RK_PB3 },
+	{ 0, RK_PB4 }, { 0, RK_PB5 }, { 0, RK_PB6 }, { 0, RK_PB7 },
+	{ 0, RK_PC0 }, { 0, RK_PC1 }, { 0, RK_PC2 }, { 0, RK_PC3 },
+	{ 0, RK_PC4 }, { 0, RK_PC5 }, { 0, RK_PC6 }, { 0, RK_PC7 },
+	{ 1, RK_PB1 }, { 1, RK_PB2 }, { 1, RK_PB3 }, { 1, RK_PC2 },
+	{ 1, RK_PC3 }, { 1, RK_PD1 }, { 1, RK_PD2 }, { 1, RK_PD3 },
+};
+
+static const struct rockchip_rmio_data rk3506_rmios[] = {
+	{
+		.pads		= rk3506_rmio_pads,
+		.nr_pins	= ARRAY_SIZE(rk3506_rmio_pads),
+		.offset		= 0x80,
+		.width		= 7,
+		.iomux_func	= 7,
+	},
+};
+
 static struct rockchip_pin_ctrl rk3506_pin_ctrl __maybe_unused = {
 	.pin_banks		= rk3506_pin_banks,
 	.nr_banks		= ARRAY_SIZE(rk3506_pin_banks),
+	.rmios			= rk3506_rmios,
+	.nr_rmios		= ARRAY_SIZE(rk3506_rmios),
 	.label			= "RK3506-GPIO",
 	.type			= RK3506,
 	.pull_calc_reg		= rk3506_calc_pull_reg_and_bit,

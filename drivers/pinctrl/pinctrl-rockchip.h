@@ -395,9 +395,37 @@ struct rockchip_mux_route_data {
 	u32 route_val;
 };
 
+/**
+ * struct rockchip_rmio_pad - pad wired to an RMIO pin
+ * @bank: pin bank of the pad
+ * @pin: pin of the pad within its bank
+ */
+struct rockchip_rmio_pad {
+	u8 bank;
+	u8 pin;
+};
+
+/**
+ * struct rockchip_rmio_data - description of an RMIO (Rockchip Matrix I/O) block
+ * @pads: pad wired to each RMIO pin
+ * @nr_pins: number of RMIO pins
+ * @offset: offset of the first RMIO pin register in the RMIO syscon
+ * @width: width of the function selector of each RMIO pin register
+ * @iomux_func: iomux function that routes a pad to its RMIO pin
+ */
+struct rockchip_rmio_data {
+	const struct rockchip_rmio_pad	*pads;
+	u32				nr_pins;
+	u32				offset;
+	u32				width;
+	u32				iomux_func;
+};
+
 struct rockchip_pin_ctrl {
 	struct rockchip_pin_bank	*pin_banks;
 	u32				nr_banks;
+	const struct rockchip_rmio_data	*rmios;
+	u32				nr_rmios;
 	u32				nr_pins;
 	char				*label;
 	enum rockchip_pinctrl_type	type;
@@ -427,6 +455,18 @@ struct rockchip_pin_config {
 	unsigned int		nconfigs;
 };
 
+/**
+ * struct rockchip_rmio_config - function selection of an RMIO pin
+ * @id: index of the RMIO block
+ * @pin: pin within the RMIO block
+ * @func: function selected for the pin
+ */
+struct rockchip_rmio_config {
+	u32 id;
+	u32 pin;
+	u32 func;
+};
+
 enum pin_config_param;
 
 struct rockchip_pin_deferred {
@@ -442,12 +482,16 @@ struct rockchip_pin_deferred {
  * @pins: the pins included in this group.
  * @npins: number of pins included in this group.
  * @data: local pin configuration
+ * @rmios: RMIO pin functions selected by this group
+ * @nrmios: number of RMIO pin functions
  */
 struct rockchip_pin_group {
 	const char			*name;
 	unsigned int			npins;
 	unsigned int			*pins;
 	struct rockchip_pin_config	*data;
+	struct rockchip_rmio_config	*rmios;
+	unsigned int			nrmios;
 };
 
 /**
@@ -468,6 +512,7 @@ struct rockchip_pinctrl {
 	struct regmap			*regmap_pull;
 	struct regmap			*regmap_pmu;
 	struct regmap			*regmap_ioc1;
+	struct regmap			**regmap_rmio;
 	struct device			*dev;
 	struct rockchip_pin_ctrl	*ctrl;
 	struct pinctrl_desc		pctl;
